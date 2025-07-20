@@ -4,13 +4,14 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
-# S3 Bucket for artifacts
+# ----------------- S3 BUCKET -----------------
+
 resource "aws_s3_bucket" "artifact_bucket" {
   bucket        = "react-vite-pipeline-artifacts"
   force_destroy = true
 }
 
-# -------------------- IAM ROLES -----------------------
+# ----------------- IAM ROLES -----------------
 
 # CodePipeline Role
 resource "aws_iam_role" "codepipeline_role" {
@@ -69,7 +70,6 @@ resource "aws_iam_role_policy" "codepipeline_policy" {
   })
 }
 
-
 # CodeBuild Role
 resource "aws_iam_role" "codebuild_role" {
   name = "codebuild_role"
@@ -81,6 +81,50 @@ resource "aws_iam_role" "codebuild_role" {
       Principal = { Service = "codebuild.amazonaws.com" },
       Action = "sts:AssumeRole"
     }]
+  })
+}
+
+resource "aws_iam_role_policy" "codedeploy_s3_policy" {
+  name = "codedeploy_s3_policy"
+  role = aws_iam_role.codedeploy_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          aws_s3_bucket.artifact_bucket.arn,
+          "${aws_s3_bucket.artifact_bucket.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "ec2_s3_policy" {
+  name = "ec2_s3_policy"
+  role = aws_iam_role.ec2_instance_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          aws_s3_bucket.artifact_bucket.arn,
+          "${aws_s3_bucket.artifact_bucket.arn}/*"
+        ]
+      }
+    ]
   })
 }
 
@@ -110,7 +154,50 @@ resource "aws_iam_role_policy" "codebuild_policy" {
   })
 }
 
-# ----------------- CodeBuild -------------------
+# EC2 Instance Role (for CodeDeploy)
+resource "aws_iam_role" "ec2_instance_role" {
+  name = "EC2CodeDeployInstanceRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_codedeploy_policy" {
+  role       = aws_iam_role.ec2_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy"
+}
+
+resource "aws_iam_instance_profile" "ec2_instance_profile" {
+  name = "EC2CodeDeployProfile"
+  role = aws_iam_role.ec2_instance_role.name
+}
+
+# CodeDeploy Role
+resource "aws_iam_role" "codedeploy_role" {
+  name = "CodeDeployServiceRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "codedeploy.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
+  role       = aws_iam_role.codedeploy_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
+}
+
+# ----------------- CodeBuild -----------------
 
 resource "aws_codebuild_project" "react_vite_build" {
   name         = "react-vite-build"
@@ -122,7 +209,7 @@ resource "aws_codebuild_project" "react_vite_build" {
 
   environment {
     compute_type    = "BUILD_GENERAL1_SMALL"
-    image           = "aws/codebuild/standard:5.0"
+    image           = "aws/codebuild/standard:7.0"  # Updated
     type            = "LINUX_CONTAINER"
     privileged_mode = false
   }
@@ -140,7 +227,7 @@ resource "aws_codebuild_project" "react_vite_build" {
   }
 }
 
-# ------------------- EC2 Instance ------------------
+# ----------------- EC2 Instance -----------------
 
 resource "aws_security_group" "ec2_sg" {
   name        = "ec2_sg"
@@ -175,6 +262,7 @@ resource "aws_instance" "app_server" {
   key_name                    = var.key_pair_name
   subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.ec2_sg.id]
+  iam_instance_profile        = aws_iam_instance_profile.ec2_instance_profile.name
 
   tags = {
     Name           = "ReactViteEC2"
@@ -184,8 +272,15 @@ resource "aws_instance" "app_server" {
   user_data = <<-EOF
               #!/bin/bash
               yum update -y
-              yum install ruby -y
-              yum install wget -y
+              yum install -y curl gcc-c++ make
+
+              # Install Node.js 18
+              curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+              yum install -y nodejs
+
+              npm install -g pm2
+
+              yum install ruby wget -y
               cd /home/ec2-user
               wget https://aws-codedeploy-${var.region}.s3.${var.region}.amazonaws.com/latest/install
               chmod +x ./install
@@ -195,30 +290,11 @@ resource "aws_instance" "app_server" {
             EOF
 }
 
-
-# ------------------ CodeDeploy --------------------
+# ----------------- CodeDeploy -----------------
 
 resource "aws_codedeploy_app" "react_vite_app" {
   name             = "ReactViteApp"
   compute_platform = "Server"
-}
-
-resource "aws_iam_role" "codedeploy_role" {
-  name = "CodeDeployServiceRole"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [{
-      Effect = "Allow",
-      Principal = { Service = "codedeploy.amazonaws.com" },
-      Action = "sts:AssumeRole"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "codedeploy_attach" {
-  role       = aws_iam_role.codedeploy_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
 }
 
 resource "aws_codedeploy_deployment_group" "react_vite_dg" {
@@ -243,7 +319,7 @@ resource "aws_codedeploy_deployment_group" "react_vite_dg" {
   }
 }
 
-# ------------------ CodePipeline ----------------------
+# ----------------- CodePipeline -----------------
 
 resource "aws_codepipeline" "react_vite_pipeline" {
   name     = "react-vite-codepipeline"
